@@ -1,0 +1,84 @@
+name: price-watch
+
+on:
+  schedule:
+    # 5分おき。GitHub 側の混雑で数分〜十数分遅れることがある（GitHub Actions の仕様）。
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Slack に送らず、通知内容の確認だけ行う"
+        type: boolean
+        default: false
+
+# state ブランチに価格の記憶を push するために必要。
+permissions:
+  contents: write
+
+# 前の実行が終わる前に次が始まると、状態の上書き合戦になるので直列化する。
+concurrency:
+  group: price-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: 依存関係をインストール
+        run: pip install -r requirements.txt
+
+      - name: 前回の価格を復元
+        run: |
+          mkdir -p state
+          if git fetch --depth=1 origin state 2>/dev/null; then
+            git show FETCH_HEAD:state.json > state/state.json
+            echo "前回の状態を復元しました ($(wc -c < state/state.json) バイト)"
+          else
+            echo "state ブランチがまだありません。初回実行として続行します"
+          fi
+
+      - name: 価格をチェック
+        env:
+          # Slack。トークン方式（DM に届く）か Webhook 方式のどちらかを設定する。
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        # 手動実行は「動いているか確かめたい」場面なので、該当が無くても必ず報告させる。
+        run: >-
+          python -m src.main
+          ${{ github.event_name == 'workflow_dispatch' && '--report' || '' }}
+          ${{ inputs.dry_run && '--dry-run' || '' }}
+
+      - name: 価格を保存
+        # 通知に失敗した回でも、観測した価格は残す。
+        if: always()
+        run: |
+          if [ ! -f state/state.json ]; then
+            echo "保存する状態がありません"
+            exit 0
+          fi
+          git config user.name "price-watch[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # 親を持たない単一コミットを force push する。
+          # 5分おきに走るので、履歴を積むとリポジトリがすぐ肥大化してしまう。
+          blob=$(git hash-object -w state/state.json)
+          tree=$(printf '100644 blob %s\tstate.json\n' "$blob" | git mktree)
+          commit=$(git commit-tree "$tree" -m "state: $(date -u +%Y-%m-%dT%H:%M:%SZ)")
+          for attempt in 1 2 3 4; do
+            if git push --force origin "$commit:refs/heads/state"; then
+              exit 0
+            fi
+            echo "push に失敗しました。$((2 ** attempt)) 秒待って再試行します"
+            sleep $((2 ** attempt))
+          done
+          echo "state の push に4回失敗しました" >&2
+          exit 1
